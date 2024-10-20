@@ -1,0 +1,28 @@
+[package]
+name = "kvs"
+version = "0.1.0"
+authors = ["pokhanto"]
+description = "A key-value store"
+edition = "2018"
+
+[[bench]]
+name = "bench"
+harness = false
+
+[dependencies]
+clap = {version ="4.5.5", features = ["cargo", "derive"]}
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
+sled = "0.34.7"
+
+[dev-dependencies]
+assert_cmd = "2.0.16"
+criterion = "0.5.1"
+predicates = "3.1.2"
+rand = {version = "0.8.5", features = ["small_rng"]}
+tempfile = "3.13.0"
+walkdir = "2.5.0"
+crossbeam-utils = "0.8.20"
+panic-control = "0.1.4"
