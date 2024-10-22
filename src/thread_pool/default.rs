@@ -29,15 +29,16 @@ impl ThreadPool for DefaultThreadPool {
         let receiver = Arc::new(Mutex::new(receiver));
         for _ in 0..threads {
             let receiver = Arc::clone(&receiver);
-            thread::spawn(move || {
+            thread::spawn(move || loop {
                 let receiver = receiver.lock().unwrap();
-                let message = receiver.recv().unwrap();
 
-                match message {
-                    ThreadPoolMessage::RunJob(job) => {
+                match receiver.recv() {
+                    Ok(ThreadPoolMessage::RunJob(job)) => {
                         job();
                     }
-                    ThreadPoolMessage::Shutdown => {}
+                    _ => {
+                        break;
+                    }
                 }
             });
         }

@@ -5,7 +5,7 @@ pub enum DbError {
     LogFileOpen,
     LogFileWrite,
     KeyNotFound,
-    Io,
+    Io(io::Error),
     Serde(serde_json::Error),
     String(String),
     Unknown,
@@ -17,7 +17,7 @@ impl fmt::Display for DbError {
             DbError::LogFileOpen => write!(f, "Can't open log file."),
             DbError::LogFileWrite => write!(f, "Can't write to log file."),
             DbError::KeyNotFound => write!(f, "Key not found."),
-            DbError::Io => write!(f, "IO error."),
+            DbError::Io(error) => write!(f, "IO error. {}", error),
             DbError::Serde(error) => write!(f, "Serde error. {}", error),
             DbError::String(message) => write!(f, "{}", message),
             DbError::Unknown => write!(f, "Unknown error."),
@@ -26,8 +26,8 @@ impl fmt::Display for DbError {
 }
 
 impl From<io::Error> for DbError {
-    fn from(_: io::Error) -> DbError {
-        DbError::Io
+    fn from(error: io::Error) -> DbError {
+        DbError::Io(error)
     }
 }
 

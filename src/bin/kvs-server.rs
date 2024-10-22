@@ -1,4 +1,8 @@
-use std::{env::current_dir, str::FromStr};
+use std::{
+    env::current_dir,
+    str::FromStr,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use clap::{crate_authors, crate_description, crate_version, Arg, Command};
 use kvs::{

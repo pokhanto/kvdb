@@ -1,11 +1,10 @@
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-
+use std::net::TcpListener;
 use tracing::{error, info};
 
 use crate::engines::KvsEngine;
 use crate::thread_pool::{DefaultThreadPool, ThreadPool};
-use crate::{Request, Response};
+use crate::{Request, Response, Result};
 
 /// Server
 pub struct KvServer<E: KvsEngine, P: ThreadPool> {
@@ -23,7 +22,8 @@ impl<E: KvsEngine, P: ThreadPool> KvServer<E, P> {
     }
 
     /// start server
-    pub fn start(&mut self, address: &str) -> std::io::Result<()> {
+    pub fn start(&mut self, address: &str) -> Result<()> {
+        println!("Start {}", address);
         let listener = TcpListener::bind(address)?;
 
         for stream in listener.incoming() {

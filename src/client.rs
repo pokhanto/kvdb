@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 use tracing::info;
 
 use crate::error::DbError;
@@ -23,7 +24,7 @@ impl KvClient {
             key: key.to_string(),
         };
 
-        match self.send(&request).unwrap() {
+        match self.send(&request)? {
             Response::Value { value } => Ok(value),
             Response::Error { message } => Err(DbError::String(message)),
             _ => Err(DbError::Unknown),
