@@ -1,19 +1,20 @@
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
+use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
 use crate::error::{DbError, Result};
 
-use super::KvsEngine;
+use super::{Command, CommandIndex, KvsEngine};
 
-const COMPACTION_THRESHOLD: u64 = 128 * 128;
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 /// The `KvStore` stores string key/value pairs.
 ///
@@ -31,16 +32,9 @@ const COMPACTION_THRESHOLD: u64 = 128 * 128;
 #[derive(Debug, Clone)]
 pub struct KvStore {
     path: PathBuf,
-    index: Arc<Mutex<BTreeMap<String, CommandIndex>>>,
-    reader: Arc<Mutex<KvReader>>,
+    index: Arc<SkipMap<String, CommandIndex>>,
+    reader: Arc<Mutex<KvPReader>>,
     writer: Arc<Mutex<KvWriter>>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "command_type")]
-pub enum Command {
-    Set { key: String, value: String },
-    Remove { key: String },
 }
 
 impl KvsEngine for KvStore {
@@ -57,18 +51,19 @@ impl KvsEngine for KvStore {
         writer.flush()?;
 
         if let Command::Set { key, .. } = command {
-            let mut index = self.index.lock().unwrap();
+            let index = &self.index;
             // if command for given key already exists in index
             // add to uncompacted
-            if let Some(old_command) = index.insert(
+            if let Some(old_command) = index.remove(&key) {
+                writer.add_uncompacted(old_command.value().len);
+            }
+            index.insert(
                 key,
                 CommandIndex {
                     pos,
                     len: new_pos - pos,
                 },
-            ) {
-                writer.add_uncompacted(old_command.len);
-            }
+            );
         }
 
         if writer.get_uncompacted() > COMPACTION_THRESHOLD {
@@ -81,14 +76,23 @@ impl KvsEngine for KvStore {
     ///
     /// Returns `None` if the given key does not exist.
     fn get(&self, key: String) -> Result<Option<String>> {
-        let index = self.index.lock().unwrap();
+        let index = &self.index;
         if let Some(index) = index.get(&key) {
             let mut reader = self.reader.lock().unwrap();
-            let command = reader.read(index.pos, index.len)?;
+            let value = index.value();
 
-            if let Command::Set { value, .. } = command {
-                return Ok(Some(value));
-            }
+            match reader.read(value.pos, value.len) {
+                Ok(Command::Set { value, .. }) => {
+                    return Ok(Some(value));
+                }
+                Err(error) => {
+                    println!("error: {:?}", error);
+                    return Err(error);
+                }
+                _ => {
+                    return Ok(None);
+                }
+            };
         }
 
         Ok(None)
@@ -96,7 +100,7 @@ impl KvsEngine for KvStore {
 
     /// Remove a given key.
     fn remove(&self, key: String) -> Result<()> {
-        let mut index = self.index.lock().unwrap();
+        let index = &self.index;
         if index.contains_key(&key) {
             let command = Command::Remove { key: key.clone() };
             let mut writer = self.writer.lock().unwrap();
@@ -104,7 +108,7 @@ impl KvsEngine for KvStore {
 
             if let Command::Remove { key } = command {
                 let old_command = index.remove(&key).expect("Key not found.");
-                writer.add_uncompacted(old_command.len);
+                writer.add_uncompacted(old_command.value().len);
             }
 
             Ok(())
@@ -120,15 +124,15 @@ impl KvStore {
         let mut buf_writer = create_writer(&path.join("data.log"))?;
         let mut buf_reader = BufReaderWithPos::new(File::open(path.join("data.log"))?)?;
 
-        let mut index: BTreeMap<String, CommandIndex> = BTreeMap::default();
+        let mut index: SkipMap<String, CommandIndex> = SkipMap::default();
 
         let uncompacted = load(&mut buf_reader, &mut buf_writer, &mut index)?;
         let writer = KvWriter::new(buf_writer, uncompacted);
-        let reader = KvReader::new(buf_reader);
+        let reader = KvPReader::new(File::open(path.join("data.log"))?);
 
         Ok(Self {
             path: path.to_path_buf(),
-            index: Arc::new(Mutex::new(index)),
+            index: Arc::new(index),
             writer: Arc::new(Mutex::new(writer)),
             reader: Arc::new(Mutex::new(reader)),
         })
@@ -140,15 +144,15 @@ impl KvStore {
         fs::rename(&path, &temp_path)?;
 
         let new_buf_writer = create_writer(&path)?;
-        let reader = Arc::clone(&self.reader);
-        let mut reader = reader.lock().unwrap();
-        let index = self.index.lock().unwrap();
+        let mut reader = self.reader.lock().unwrap();
+        let index = &self.index;
 
         let mut new_writer = KvWriter::new(new_buf_writer, 0);
 
-        for command_index in index.values() {
-            let command = reader.read(command_index.pos, command_index.len)?;
-            new_writer.write(&command);
+        for command_index in index.iter() {
+            let value = command_index.value();
+            let command = reader.read(value.pos, value.len)?;
+            new_writer.write(&command)?;
         }
 
         new_writer.flush()?;
@@ -168,16 +172,10 @@ fn create_writer(path: &PathBuf) -> Result<BufWriterWithPos<File>> {
     Ok(writer)
 }
 
-#[derive(Debug, Clone)]
-struct CommandIndex {
-    pos: u64,
-    len: u64,
-}
-
 fn load(
     reader: &mut BufReaderWithPos<File>,
     writer: &mut BufWriterWithPos<File>,
-    index: &mut BTreeMap<String, CommandIndex>,
+    index: &mut SkipMap<String, CommandIndex>,
 ) -> Result<u64> {
     let mut uncompacted = 0;
     let mut pos = reader.seek(SeekFrom::Start(0))?;
@@ -186,44 +184,71 @@ fn load(
         let new_pos = stream.byte_offset() as u64;
         match cmd? {
             Command::Set { key, .. } => {
-                if let Some(old_command) = index.insert(
+                if let Some(old_command) = index.remove(&key) {
+                    uncompacted += old_command.value().len;
+                }
+                index.insert(
                     key,
                     CommandIndex {
                         pos,
                         len: new_pos - pos,
                     },
-                ) {
-                    uncompacted += old_command.len;
-                }
+                );
             }
             Command::Remove { key } => {
                 if let Some(old_command) = index.remove(&key) {
-                    uncompacted += old_command.len;
+                    uncompacted += old_command.value().len;
                 }
             }
         }
         pos = new_pos;
     }
-    writer.seek(SeekFrom::Start(pos));
+    writer.seek(SeekFrom::Start(pos))?;
     Ok(uncompacted)
+}
+
+trait KvRead {
+    fn read(&mut self, pos: u64, len: u64) -> Result<Command>;
 }
 
 #[derive(Debug)]
 struct KvReader {
-    reader: BufReaderWithPos<File>,
+    reader: BufReader<File>,
 }
 
 impl KvReader {
-    fn new(reader: BufReaderWithPos<File>) -> Self {
+    fn new(reader: BufReader<File>) -> Self {
         Self { reader }
     }
-
+}
+impl KvRead for KvReader {
     fn read(&mut self, pos: u64, len: u64) -> Result<Command> {
         self.reader.seek(SeekFrom::Start(pos))?;
 
         let mut buffer = vec![0; len as usize];
         self.reader.read_exact(&mut buffer)?;
         let command: Command = serde_json::from_slice(&buffer)?;
+
+        Ok(command)
+    }
+}
+
+use nix::sys::uio::pread;
+#[derive(Debug)]
+struct KvPReader {
+    file: File,
+}
+
+impl KvPReader {
+    fn new(file: File) -> Self {
+        Self { file }
+    }
+}
+impl KvRead for KvPReader {
+    fn read(&mut self, pos: u64, len: u64) -> Result<Command> {
+        let mut buffer = vec![0; len as usize];
+        pread(self.file.as_fd(), &mut buffer, pos as i64).unwrap();
+        let command = serde_json::from_slice(&buffer)?;
 
         Ok(command)
     }
@@ -269,7 +294,7 @@ impl KvWriter {
 #[derive(Debug)]
 struct BufReaderWithPos<R: Read + Seek> {
     reader: BufReader<R>,
-    pos: u64,
+    //pos: u64,
 }
 
 impl<R: Read + Seek> BufReaderWithPos<R> {
@@ -277,7 +302,7 @@ impl<R: Read + Seek> BufReaderWithPos<R> {
         let pos = inner.stream_position()?;
         Ok(BufReaderWithPos {
             reader: BufReader::new(inner),
-            pos,
+            //pos,
         })
     }
 }
@@ -285,15 +310,16 @@ impl<R: Read + Seek> BufReaderWithPos<R> {
 impl<R: Read + Seek> Read for BufReaderWithPos<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let len = self.reader.read(buf)?;
-        self.pos += len as u64;
+        //self.pos += len as u64;
         Ok(len)
     }
 }
 
 impl<R: Read + Seek> Seek for BufReaderWithPos<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = self.reader.seek(pos)?;
-        Ok(self.pos)
+        //self.pos = self.reader.seek(pos)?;
+        //Ok(self.pos)
+        self.reader.seek(pos)
     }
 }
 

@@ -1,14 +1,7 @@
-use std::{
-    env::current_dir,
-    str::FromStr,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{env::current_dir, str::FromStr};
 
 use clap::{crate_authors, crate_description, crate_version, Arg, Command};
-use kvs::{
-    thread_pool::{DefaultThreadPool, ThreadPool},
-    KvServer, KvStore,
-};
+use kvs::{thread_pool::ThreadPool, KvServer, KvStore};
 use tracing::{info, Level};
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:4000";
@@ -64,17 +57,15 @@ fn main() {
     let engine = matches.get_one::<EngineType>("engine").unwrap();
     info!("Engine: {:?}", engine);
 
-    let thread_pool = DefaultThreadPool::new(6).unwrap();
+    let thread_pool = ThreadPool::new(6).unwrap();
 
     let mut kv_server = match engine {
-        EngineType::Kvs => KvServer::<KvStore, DefaultThreadPool>::new(
-            KvStore::open(&current_dir().unwrap()).unwrap(),
-            thread_pool,
-        ),
-        EngineType::Sled => KvServer::<KvStore, DefaultThreadPool>::new(
-            KvStore::open(&current_dir().unwrap()).unwrap(),
-            thread_pool,
-        ),
+        EngineType::Kvs => {
+            KvServer::<KvStore>::new(KvStore::open(&current_dir().unwrap()).unwrap(), thread_pool)
+        }
+        EngineType::Sled => {
+            KvServer::<KvStore>::new(KvStore::open(&current_dir().unwrap()).unwrap(), thread_pool)
+        }
     };
 
     kv_server.start(address).unwrap();

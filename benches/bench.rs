@@ -1,261 +1,202 @@
 use std::{
-    any::Any,
     net::TcpListener,
-    sync::{
-        atomic::{AtomicBool, AtomicU32},
-        mpsc, Arc, Condvar, Mutex,
-    },
+    sync::{atomic::AtomicU32, mpsc, Arc},
     thread,
     time::Duration,
 };
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use kvs::{
-    thread_pool::{DefaultThreadPool, ThreadPool},
-    KvClient, KvServer, KvStore, KvsEngine,
-};
-use lazy_static::lazy_static;
-use rand::prelude::*;
+use console_subscriber::ConsoleLayer;
+use criterion::{criterion_group, criterion_main, Criterion};
+use kvs::{thread_pool::ThreadPool, KvClient, KvServer, KvServerAsync, KvStore, KvStoreAsync};
 use tempfile::TempDir;
+use tokio::runtime::Builder;
 
-fn set_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("set_bench");
-    group.bench_function("kvs", |b| {
-        b.iter_batched(
-            || {
-                let temp_dir = TempDir::new().unwrap();
-                (KvStore::open(temp_dir.path()).unwrap(), temp_dir)
-            },
-            |(store, _temp_dir)| {
-                for i in 1..(1 << 12) {
-                    store.set(format!("key{}", i), "value".to_string()).unwrap();
-                }
-            },
-            BatchSize::SmallInput,
-        )
-    });
-    // group.bench_function("sled", |b| {
-    //     b.iter_batched(
-    //         || {
-    //             let temp_dir = TempDir::new().unwrap();
-    //             (SledKvsEngine::new(sled::open(&temp_dir).unwrap()), temp_dir)
-    //         },
-    //         |(mut db, _temp_dir)| {
-    //             for i in 1..(1 << 12) {
-    //                 db.set(format!("key{}", i), "value".to_string()).unwrap();
-    //             }
-    //         },
-    //         BatchSize::SmallInput,
-    //     )
-    // });
-    group.finish();
-}
-
-fn get_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("get_bench");
-    for i in &vec![8, 12, 16, 20] {
-        group.bench_with_input(format!("kvs_{}", i), i, |b, i| {
-            let temp_dir = TempDir::new().unwrap();
-            let mut store = KvStore::open(temp_dir.path()).unwrap();
-            for key_i in 1..(1 << i) {
-                store
-                    .set(format!("key{}", key_i), "value".to_string())
-                    .unwrap();
-            }
-            let mut rng = SmallRng::from_seed([0; 32]);
-            b.iter(|| {
-                store
-                    .get(format!("key{}", rng.gen_range(1..1 << i)))
-                    .unwrap();
-            })
-        });
-    }
-    // for i in &vec![8, 12, 16, 20] {
-    //     group.bench_with_input(format!("sled_{}", i), i, |b, i| {
-    //         let temp_dir = TempDir::new().unwrap();
-    //         let mut db = SledKvsEngine::new(sled::open(&temp_dir).unwrap());
-    //         for key_i in 1..(1 << i) {
-    //             db.set(format!("key{}", key_i), "value".to_string())
-    //                 .unwrap();
-    //         }
-    //         let mut rng = SmallRng::from_seed([0; 16]);
-    //         b.iter(|| {
-    //             db.get(format!("key{}", rng.gen_range(1, 1 << i))).unwrap();
-    //         })
-    //     });
-    // }
-    group.finish();
-}
-
-lazy_static! {
-    static ref RANGE: Arc<Mutex<(u32, u32)>> = Arc::new(Mutex::new((4000, 6000)));
-}
+const SAMPLE_SIZE: usize = 50;
+const MEASUREMENT_TIME_SEC: u64 = 30;
+const ENTRIES_NUMBER: u32 = 600;
+const CLINET_THREADS_NUMBER: u32 = ENTRIES_NUMBER / 60;
 
 fn find_free_port() -> Option<u32> {
-    let mut range = RANGE.lock().unwrap();
-    let (start, end) = *range;
+    let (start, end) = (4000, 6000);
 
     for port in start..=end {
         let addr = format!("127.0.0.1:{}", port);
         if TcpListener::bind(&addr).is_ok() {
-            *range = (port + 1, end);
             return Some(port);
         }
     }
+
     None
 }
 
-fn parallel_set_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parallel_set_bench");
-    for i in &[3, 2] {
-        group.bench_with_input(format!("kvs_{}", i), i, |b, i| {
-            let port = find_free_port().unwrap();
-            let addr = format!("127.0.0.1:{}", port);
-            let k = 10;
-            let temp_dir = TempDir::new().unwrap();
-
-            let thread_pool = DefaultThreadPool::new(*i).unwrap();
-
-            let client_thread_pool = DefaultThreadPool::new(k).unwrap();
-            let data = (0..1000)
-                .map(|i| (format!("key{}", i), "value".to_string()))
-                .collect::<Vec<(String, String)>>();
-
-            let ad = addr.clone();
-            thread::spawn(move || {
-                let mut server = KvServer::<KvStore, DefaultThreadPool>::new(
-                    KvStore::open(temp_dir.path()).unwrap(),
-                    thread_pool,
-                );
-                server.start(ad.as_str()).unwrap();
-            });
-
-            let counter = Arc::new(AtomicU32::new(0));
-            let pair = Arc::new((Mutex::new(false), Condvar::new()));
-            let (lock, cvar) = &*pair;
-
-            // wait server to start
-            thread::sleep(Duration::from_secs(1));
-
-            let client_thread_pool = Arc::new(client_thread_pool);
-            let data = Arc::new(data);
-            let client = KvClient::new(addr);
-            let client = Arc::new(client);
-            b.iter(|| {
-                let client_thread_pool = Arc::clone(&client_thread_pool);
-
-                for i in 0..k {
-                    let client = Arc::clone(&client);
-                    let data = Arc::clone(&data);
-                    let counter = Arc::clone(&counter);
-                    let pair = Arc::clone(&pair);
-
-                    client_thread_pool.spawn(move || {
-                        let (key, value) = data.get(i as usize).unwrap();
-                        client.set(key.clone(), value.clone()).unwrap();
-                        counter.fetch_add(1, std::sync::atomic::Ordering::Release);
-
-                        if counter.load(std::sync::atomic::Ordering::Acquire) == k {
-                            let (lock, cvar) = &*pair;
-                            let mut done = lock.lock().unwrap();
-                            *done = true;
-                            cvar.notify_one();
-                        }
-                    });
-                }
-            });
-            let mut done = lock.lock().unwrap();
-            while !*done {
-                done = cvar.wait(done).unwrap();
-            }
-        });
-    }
-    group.finish();
-}
-
 fn parallel_get_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parallel_get_bench");
-    for i in &[2, 3] {
-        group.bench_with_input(format!("kvs_{}", i), i, |b, i| {
-            // println!("start iter {:?}", );
-            let id = rand::random::<u32>();
-            println!("start iter with id {}", id);
-            let port = find_free_port().unwrap();
-            let addr = format!("127.0.0.1:{}", port);
-            let k = 10;
-            let temp_dir = TempDir::new().unwrap();
-            let thread_pool = DefaultThreadPool::new(*i).unwrap();
+    let mut group = c.benchmark_group("parallel get");
+    group.sample_size(SAMPLE_SIZE);
+    group.measurement_time(Duration::from_secs(MEASUREMENT_TIME_SEC));
 
-            let client_thread_pool = DefaultThreadPool::new(k).unwrap();
-            let data = (0..k)
-                .map(|i| (format!("key{}", i), "value".to_string()))
-                .collect::<Vec<(String, String)>>();
+    for thread_number in &[1, 2, 4, 8, 16] {
+        group.bench_with_input(
+            format!("{}-thread threadpool", thread_number),
+            thread_number,
+            |b, thread_number| {
+                let port = find_free_port().unwrap();
+                let addr = format!("127.0.0.1:{}", port);
+                let temp_dir = TempDir::new().unwrap();
+                let thread_pool = ThreadPool::new(*thread_number).unwrap();
 
-            let ad = addr.clone();
+                let client_thread_pool = ThreadPool::new(CLINET_THREADS_NUMBER).unwrap();
+                let data = (0..ENTRIES_NUMBER)
+                    .map(|i| (format!("key{}", i), "value".to_string()))
+                    .collect::<Vec<(String, String)>>();
 
-            thread::spawn(move || {
-                let mut server = KvServer::<KvStore, DefaultThreadPool>::new(
-                    KvStore::open(temp_dir.path()).unwrap(),
-                    thread_pool,
-                );
-                server.start(ad.as_str()).unwrap();
-            });
+                let ad = addr.clone();
 
-            // wait server to start
-            thread::sleep(Duration::from_secs(1));
+                thread::spawn(move || {
+                    let mut server = KvServer::<KvStore>::new(
+                        KvStore::open(temp_dir.path()).unwrap(),
+                        thread_pool,
+                    );
+                    server.start(ad.as_str()).unwrap();
+                });
 
-            let client = KvClient::new(addr);
+                // wait server to start
+                thread::sleep(Duration::from_secs(1));
 
-            let (end_work_sender, end_work_receiver) = mpsc::channel::<()>();
+                let client = KvClient::new(addr);
 
-            println!("start setting data");
-            for (key, value) in data.clone() {
-                client.set(key, value).unwrap();
-            }
-            println!("end setting data");
+                let (end_work_sender, end_work_receiver) = mpsc::channel::<()>();
 
-            let counter = Arc::new(AtomicU32::new(0));
-
-            let client_thread_pool = Arc::new(client_thread_pool);
-            let data = Arc::new(data);
-            let client = Arc::new(client);
-            let end_work_sender = Arc::new(end_work_sender);
-            b.iter(|| {
-                counter.store(0, std::sync::atomic::Ordering::Release);
-                let client_thread_pool = Arc::clone(&client_thread_pool);
-
-                for i in 0..k {
-                    let client = Arc::clone(&client);
-                    let data = Arc::clone(&data);
-                    let counter = Arc::clone(&counter);
-                    let end_work_sender = Arc::clone(&end_work_sender);
-
-                    client_thread_pool.spawn(move || {
-                        let (key, value) = data.get(i as usize).unwrap();
-                        match client.get(key.clone()) {
-                            Ok(stored_value) => {
-                                assert_eq!(Some(value), stored_value.as_ref());
-                            }
-                            Err(e) => {
-                                println!("requesting {key} in {id}");
-                                println!("err on id {id} {e}");
-                            }
-                        }
-
-                        let prev = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-
-                        if prev + 1 == k {
-                            end_work_sender.send(()).unwrap();
-                        }
-                    });
+                for (key, value) in data.clone() {
+                    client.set(key, value).unwrap();
                 }
-                end_work_receiver.recv().unwrap();
-            });
-        });
+
+                let counter = Arc::new(AtomicU32::new(0));
+
+                let client_thread_pool = Arc::new(client_thread_pool);
+                let data = Arc::new(data);
+                let client = Arc::new(client);
+                let end_work_sender = Arc::new(end_work_sender);
+                b.iter(|| {
+                    counter.store(0, std::sync::atomic::Ordering::Release);
+                    let client_thread_pool = Arc::clone(&client_thread_pool);
+
+                    for i in 0..ENTRIES_NUMBER {
+                        let client = Arc::clone(&client);
+                        let data = Arc::clone(&data);
+                        let counter = Arc::clone(&counter);
+                        let end_work_sender = Arc::clone(&end_work_sender);
+
+                        client_thread_pool.spawn(move || {
+                            let (key, value) = data.get(i as usize).unwrap();
+                            match client.get(key.clone()) {
+                                Ok(stored_value) => {
+                                    assert_eq!(Some(value), stored_value.as_ref());
+                                }
+                                Err(e) => {
+                                    println!("err {e}");
+                                }
+                            }
+
+                            let prev = counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+
+                            if prev + 1 == ENTRIES_NUMBER {
+                                end_work_sender.send(()).unwrap();
+                            }
+                        });
+                    }
+                    end_work_receiver.recv().unwrap();
+                });
+            },
+        );
     }
     group.finish();
 }
 
-criterion_group!(benches, parallel_get_bench);
-//criterion_group!(benches, set_bench, get_bench);
+fn async_get_bench(c: &mut Criterion) {
+    //ConsoleLayer::builder().init();
+    let mut group = c.benchmark_group("async get");
+    group.sample_size(SAMPLE_SIZE);
+    group.measurement_time(Duration::from_secs(MEASUREMENT_TIME_SEC));
+
+    let workers = 6;
+
+    let server_runtime = Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap();
+    group.bench_function(format!("tokio with {workers} workers"), |bench| {
+        let port = find_free_port().unwrap();
+        let addres = format!("127.0.0.1:{}", port);
+        let temp_dir = TempDir::new().unwrap();
+
+        let client_thread_pool = ThreadPool::new(CLINET_THREADS_NUMBER).unwrap();
+        let data = (0..ENTRIES_NUMBER)
+            .map(|i| (format!("key{}", i), "value".to_string()))
+            .collect::<Vec<(String, String)>>();
+
+        let address = addres.clone();
+
+        server_runtime.block_on(async {
+            tokio::spawn(async move {
+                let mut server = KvServerAsync::<KvStoreAsync>::new(
+                    KvStoreAsync::open(temp_dir.path()).await.unwrap(),
+                );
+                server.start(address.as_str()).await.unwrap();
+            });
+        });
+
+        // wait server to start
+        thread::sleep(Duration::from_secs(1));
+
+        let client = KvClient::new(addres);
+
+        let (end_work_sender, end_work_receiver) = mpsc::channel::<()>();
+
+        for (key, value) in data.clone() {
+            client.set(key, value).unwrap();
+        }
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let client_thread_pool = Arc::new(client_thread_pool);
+        let data = Arc::new(data);
+        let client = Arc::new(client);
+        let end_work_sender = Arc::new(end_work_sender);
+        let client_thread_pool = Arc::clone(&client_thread_pool);
+        bench.iter(|| {
+            counter.store(0, std::sync::atomic::Ordering::Release);
+
+            for i in 0..ENTRIES_NUMBER {
+                let client = Arc::clone(&client);
+                let data = Arc::clone(&data);
+                let counter = Arc::clone(&counter);
+                let end_work_sender = Arc::clone(&end_work_sender);
+
+                client_thread_pool.spawn(move || {
+                    let (key, value) = data.get(i as usize).unwrap();
+                    match client.get(key.clone()) {
+                        Ok(stored_value) => {
+                            assert_eq!(Some(value), stored_value.as_ref());
+                        }
+                        Err(e) => {
+                            println!("requesting {key} err {e}");
+                        }
+                    }
+
+                    let prev = counter.fetch_add(1, std::sync::atomic::Ordering::Acquire);
+
+                    if prev + 1 == ENTRIES_NUMBER {
+                        end_work_sender.send(()).unwrap();
+                    }
+                });
+            }
+            end_work_receiver.recv().unwrap();
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, async_get_bench, parallel_get_bench);
 criterion_main!(benches);

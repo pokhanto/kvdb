@@ -8,20 +8,19 @@ use std::{
 
 use crate::Result;
 
-use super::ThreadPool;
-
 enum ThreadPoolMessage {
     RunJob(Box<dyn FnOnce() + Send + 'static>),
     Shutdown,
 }
 
-/// Default thread pool
-pub struct DefaultThreadPool {
+///  Thread pool
+pub struct ThreadPool {
     sender: Sender<ThreadPoolMessage>,
 }
 
-impl ThreadPool for DefaultThreadPool {
-    fn new(threads: u32) -> Result<Self>
+impl ThreadPool {
+    /// Create new thread pool with predefined number of threads
+    pub fn new(threads: u32) -> Result<Self>
     where
         Self: Sized,
     {
@@ -31,8 +30,10 @@ impl ThreadPool for DefaultThreadPool {
             let receiver = Arc::clone(&receiver);
             thread::spawn(move || loop {
                 let receiver = receiver.lock().unwrap();
+                let message = receiver.recv();
+                drop(receiver);
 
-                match receiver.recv() {
+                match message {
                     Ok(ThreadPoolMessage::RunJob(job)) => {
                         job();
                     }
@@ -45,7 +46,8 @@ impl ThreadPool for DefaultThreadPool {
         Ok(Self { sender })
     }
 
-    fn spawn<F>(&self, job: F)
+    /// start work on thread pool thread
+    pub fn spawn<F>(&self, job: F)
     where
         F: FnOnce() + Send + 'static,
     {
@@ -55,7 +57,7 @@ impl ThreadPool for DefaultThreadPool {
     }
 }
 
-impl Drop for DefaultThreadPool {
+impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.sender.send(ThreadPoolMessage::Shutdown).unwrap();
     }

@@ -3,18 +3,18 @@ use std::net::TcpListener;
 use tracing::{error, info};
 
 use crate::engines::KvsEngine;
-use crate::thread_pool::{DefaultThreadPool, ThreadPool};
+use crate::thread_pool::ThreadPool;
 use crate::{Request, Response, Result};
 
 /// Server
-pub struct KvServer<E: KvsEngine, P: ThreadPool> {
-    thread_pool: P,
+pub struct KvServer<E: KvsEngine> {
+    thread_pool: ThreadPool,
     engine: E,
 }
 
-impl<E: KvsEngine, P: ThreadPool> KvServer<E, P> {
+impl<E: KvsEngine> KvServer<E> {
     /// Create new server with given address
-    pub fn new(engine: E, thread_pool: P) -> Self {
+    pub fn new(engine: E, thread_pool: ThreadPool) -> Self {
         Self {
             engine,
             thread_pool,
@@ -23,7 +23,6 @@ impl<E: KvsEngine, P: ThreadPool> KvServer<E, P> {
 
     /// start server
     pub fn start(&mut self, address: &str) -> Result<()> {
-        println!("Start {}", address);
         let listener = TcpListener::bind(address)?;
 
         for stream in listener.incoming() {
