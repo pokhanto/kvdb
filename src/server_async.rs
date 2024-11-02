@@ -25,25 +25,10 @@ impl<E: KvsEngineAsync> KvServerAsync<E> {
         loop {
             let (mut socket, _) = listener.accept().await?;
             let engine = Arc::clone(&self.engine);
+            let _ = socket.set_nodelay(true);
 
             tokio::spawn(async move {
-                let mut length_buf = [0; 4];
-
-                socket
-                    .read_exact(&mut length_buf)
-                    .await
-                    .expect("failed to read data from socket");
-
-                let msg_length = u32::from_be_bytes(length_buf) as usize;
-
-                let mut msg_buf = vec![0; msg_length];
-                socket
-                    .read_exact(&mut msg_buf)
-                    .await
-                    .expect("failed to read data from socket");
-
-                let request: Request = serde_json::from_slice(&msg_buf).unwrap();
-                // info!("Received request: {:?}", &request);
+                let request = Request::deserialize(&mut socket).await.unwrap();
 
                 let response = match request {
                     Request::Get { key } => match engine.get(key.to_owned()).await {
@@ -70,15 +55,9 @@ impl<E: KvsEngineAsync> KvServerAsync<E> {
                     },
                 };
 
-                let response_data = serde_json::to_vec(&response).unwrap();
-                let response_length = (response_data.len() as u32).to_be_bytes();
-
+                let response = response.serialize();
                 socket
-                    .write_all(&response_length)
-                    .await
-                    .expect("failed to write data to socket");
-                socket
-                    .write_all(&response_data)
+                    .write_all(&response)
                     .await
                     .expect("failed to write data to socket");
             });

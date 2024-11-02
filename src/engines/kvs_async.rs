@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fs::{self},
     io::{self, SeekFrom},
     os::fd::AsFd,
@@ -94,18 +93,17 @@ impl KvsEngineAsync for KvStoreAsync {
         if let Some(index) = index.get(&key) {
             let value = index.value();
 
-            return Ok(Some("value".into()));
-            //match self.reader.read(value.pos, value.len).await {
-            //    Ok(Command::Set { value, .. }) => {
-            //        return Ok(Some(value));
-            //    }
-            //    Err(error) => {
-            //        return Err(error);
-            //    }
-            //    _ => {
-            //        return Ok(None);
-            //    }
-            //};
+            match self.reader.read(value.pos, value.len).await {
+                Ok(Command::Set { value, .. }) => {
+                    return Ok(Some(value));
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+                _ => {
+                    return Ok(None);
+                }
+            };
         }
 
         Ok(None)
@@ -235,8 +233,7 @@ async fn load(
 
 #[derive(Debug)]
 struct KvReader {
-    //sender: mpsc::Sender<ReadQueueMessage>,
-    queue: Arc<Mutex<VecDeque<ReadQueueMessage>>>,
+    sender: mpsc::Sender<ReadQueueMessage>,
 }
 
 #[derive(Debug)]
@@ -251,33 +248,15 @@ enum ReadQueueMessage {
 
 impl KvReader {
     fn new(file: File) -> Self {
-        //let (sender, mut receiver) = mpsc::channel::<ReadQueueMessage>(100);
-        //let file = Arc::new(file);
+        let (sender, mut receiver) = mpsc::channel::<ReadQueueMessage>(50);
+        let file = Arc::new(file);
 
-        let queue = Arc::new(Mutex::new(VecDeque::<ReadQueueMessage>::default()));
-        let queue_m = Arc::clone(&queue);
         tokio::spawn(async move {
-            let mut reader = BufReader::new(file);
             loop {
-                //let file = Arc::clone(&file);
-                //let mut messages: Vec<ReadQueueMessage> = Vec::with_capacity(100);
-                //let _count = receiver.recv_many(&mut messages, 100).await;
+                let file = Arc::clone(&file);
+                let mut messages: Vec<ReadQueueMessage> = Vec::with_capacity(50);
+                let _count = receiver.recv_many(&mut messages, 50).await;
 
-                let mut queue = queue_m.lock().await;
-                let len = queue.len();
-                if len == 0 {
-                    continue;
-                }
-                let messages = queue.drain(..len).collect::<Vec<_>>();
-                drop(queue);
-
-                //let read_messages: Vec<_> = messages
-                //    .filter(|m| matches!(m, ReadQueueMessage::Read { .. }))
-                //    .collect();
-                //let has_shutdown =
-                //let min_pos = messages.min_by(|x,y| {
-                //    mat
-                //})
                 let min_pos = messages
                     .iter()
                     .filter_map(|item| {
@@ -301,17 +280,14 @@ impl KvReader {
                     .max()
                     .unwrap();
                 let len = max_pos - min_pos;
-                reader.seek(SeekFrom::Start(min_pos)).await.unwrap();
-                let mut buffer = vec![0; len as usize];
-                reader.read_exact(&mut buffer).await.unwrap();
-                //let buffer = task::spawn_blocking(move || {
-                //    let mut buffer = vec![0; len as usize];
-                //    pread(file.as_fd(), &mut buffer, min_pos as i64).unwrap();
-                //
-                //    buffer
-                //})
-                //.await
-                //.unwrap();
+                let buffer = task::spawn_blocking(move || {
+                    let mut buffer = vec![0; len as usize];
+                    pread(file.as_fd(), &mut buffer, min_pos as i64).unwrap();
+
+                    buffer
+                })
+                .await
+                .unwrap();
 
                 for message in messages {
                     match message {
@@ -334,10 +310,7 @@ impl KvReader {
                 }
             }
         });
-        Self {
-            //sender,
-            queue,
-        }
+        Self { sender }
     }
 
     async fn read(&self, pos: u64, len: u64) -> Result<Command> {
@@ -347,11 +320,7 @@ impl KvReader {
             len,
             response_sender,
         };
-        let mut queue = self.queue.lock().await;
-        queue.push_front(message);
-        drop(queue);
-
-        //self.sender.send(message).await.unwrap();
+        self.sender.send(message).await.unwrap();
 
         let command = response_receiver.await.unwrap();
 
@@ -359,37 +328,11 @@ impl KvReader {
     }
 }
 
-//impl Drop for KvReader {
-//    fn drop(&mut self) {
-//        self.sender
-//            .blocking_send(ReadQueueMessage::Shutdown)
-//            .unwrap();
-//    }
-//}
-
-#[derive(Debug)]
-struct KvPReader {
-    file: Arc<File>,
-}
-
-impl KvPReader {
-    fn new(file: Arc<File>) -> Self {
-        Self { file }
-    }
-
-    async fn read(&mut self, pos: u64, len: u64) -> Result<Command> {
-        let file = Arc::clone(&self.file);
-        let buffer = task::spawn_blocking(move || {
-            let mut buffer = vec![0; len as usize];
-            pread(file.as_fd(), &mut buffer, pos as i64).unwrap();
-
-            buffer
-        })
-        .await
-        .unwrap();
-
-        let command = serde_json::from_slice(&buffer)?;
-        Ok(command)
+impl Drop for KvReader {
+    fn drop(&mut self) {
+        self.sender
+            .blocking_send(ReadQueueMessage::Shutdown)
+            .unwrap();
     }
 }
 

@@ -118,7 +118,7 @@ fn async_get_bench(c: &mut Criterion) {
     group.sample_size(SAMPLE_SIZE);
     group.measurement_time(Duration::from_secs(MEASUREMENT_TIME_SEC));
 
-    let workers = 6;
+    let workers = 8;
 
     let server_runtime = Builder::new_multi_thread()
         .worker_threads(workers)
